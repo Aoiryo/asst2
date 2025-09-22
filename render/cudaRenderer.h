@@ -7,6 +7,9 @@
 
 #include "circleRenderer.h"
 
+// Forward declaration for CUDA-specific structures
+struct TileCirclePair;
+
 
 class CudaRenderer : public CircleRenderer {
 
@@ -27,6 +30,28 @@ private:
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
 
+    TileCirclePair* cudaDeviceTileCirclePairs;
+    TileCirclePair* cudaDeviceSortBuffer;
+    int* cudaDeviceTileOffsets;
+    int* cudaDevicePairCounter;
+    void* cudaDeviceSortTempStorage;
+    size_t sortTempStorageBytes;
+    int* cudaDeviceCirclePairCounts;
+    int* cudaDeviceCirclePairOffsets;
+
+    int* cudaDeviceTileCounts;
+    int* cudaDeviceBucketCounters;
+    int* cudaDeviceTotalPairCounter;
+
+    int numTilesX;
+    int numTilesY;
+    int maxPairs;
+    void* cudaDeviceScanTempStorage;
+    size_t scanTempStorageBytes;
+
+    int tileWidth;
+    int tileHeight;
+
 public:
 
     CudaRenderer();
@@ -45,6 +70,10 @@ public:
     void advanceAnimation();
 
     void render();
+
+    // Dynamic tile size configuration interface
+    void setTileSize(int width, int height);
+    void getTileSize(int& width, int& height) const;
 
     void shadePixel(
         float pixelCenterX, float pixelCenterY,

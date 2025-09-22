@@ -29,6 +29,30 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upsweep_kernel(int* data, int n, int twod) {
+    int twod1 = twod << 1;                         
+    int seg = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = seg * twod1;                           
+    if (i + twod1 - 1 < n) {
+        data[i + twod1 - 1] += data[i + twod - 1];
+    }
+}
+
+__global__ void downsweep_kernel(int* data, int n, int twod) {
+    int twod1 = twod << 1;
+    int seg = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = seg * twod1;
+    if (i + twod1 - 1 < n) {
+        int t = data[i + twod - 1];
+        data[i + twod - 1]  = data[i + twod1 - 1];
+        data[i + twod1 - 1] += t;
+    }
+}
+
+__global__ void set_first_zero(int* data, int n) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) data[n - 1] = 0;
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +67,31 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+    int n = 1;
+    while (n < length) {
+       n *= 2;
+    } // make sure the array is a power of 2
+
+    // upsweep
+    for (int twod = 1; twod < n; twod <<= 1) {
+        int twod1   = twod << 1;
+        int segments = n / twod1;                
+        int threads  = 256;
+        int blocks   = (segments + threads - 1) / threads;
+        upsweep_kernel<<<blocks, threads>>>(device_data, n, twod);
+    }
+
+    // exclusive, so set the first position to 0
+    set_first_zero<<<1,1>>>(device_data, n);
+
+    // downsweep
+    for (int twod = (n >> 1); twod >= 1; twod >>= 1) {
+        int twod1   = twod << 1;
+        int segments = n / twod1;
+        int threads  = 256;
+        int blocks   = (segments + threads - 1) / threads;
+        downsweep_kernel<<<blocks, threads>>>(device_data, n, twod);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -108,7 +157,30 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void create_peaks_mask(const int* A, int N, int* mask) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    if (i == 0 || i == N - 1) { mask[i] = 0; return; }
+    mask[i] = (A[i] > A[i - 1] && A[i] > A[i + 1]) ? 1 : 0;
+}
 
+__global__ void scatter_peaks(const int* A, int N, const int* mask, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i <= 0 || i >= N - 1) return;
+    if (A[i] > A[i - 1] && A[i] > A[i + 1]) {
+        int j = mask[i];
+        output[j] = i;  // store index, not value
+    }
+}
+
+__global__ void check_last_peak(const int* A, int N, int* count) {
+    if (N > 2) {
+        int last_idx = N - 2;  // last valid peak position
+        if (A[last_idx] > A[last_idx - 1] && A[last_idx] > A[last_idx + 1]) {
+            (*count)++;
+        }
+    }
+}
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,7 +197,50 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
+    if (length <= 2) return 0;
+
+    int n = 1;
+    while (n < length) {
+       n *= 2;
+    } // make sure the array is a power of 2
+
+    int* device_mask;
+    cudaMalloc((void**)&device_mask, sizeof(int) * n);
+
+    // only set block.x
+    dim3 block(256); // use 256 threads per block
+    dim3 grid((length + block.x - 1) / block.x);
+    create_peaks_mask<<<grid, block>>>(device_input, length, device_mask);
+
+    cudaDeviceSynchronize(); // barrier
+
+    // exclusive scan for scatter positions
+    exclusive_scan(device_mask, n);
+    
+    // use thrust to find max value in device_mask (which gives us count-1)
+    thrust::device_ptr<int> d_mask(device_mask);
+    int max_scan_val = 0;
+    if (length > 2) {
+        max_scan_val = *thrust::max_element(d_mask + 1, d_mask + length - 1);
+    }
+    
+    // check if last valid position is a peak using a simple kernel
+    int* device_count;
+    cudaMalloc((void**)&device_count, sizeof(int));
+    cudaMemcpy(device_count, &max_scan_val, sizeof(int), cudaMemcpyHostToDevice);
+    
+    // launch a single thread to check last peak and update count
+    check_last_peak<<<1, 1>>>(device_input, length, device_count);
+    
+    int count;
+    cudaMemcpy(&count, device_count, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_count);
+
+    scatter_peaks<<<grid, block>>>(device_input, length, device_mask, device_output);
+
+    cudaDeviceSynchronize();
+    cudaFree(device_mask);
+    return count;
 }
 
 

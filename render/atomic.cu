@@ -24,7 +24,8 @@
 
 #include <cub/cub.cuh>
 
-#define CIRCLE_CACHE_SIZE 256
+#define TILE_WIDTH 16
+#define TILE_HEIGHT 16
 #define CUDA_CHECK(err) (cuda_check_error(err, __FILE__, __LINE__))
 
 inline void cuda_check_error(cudaError_t err, const char* file, int line) {
@@ -37,13 +38,6 @@ inline void cuda_check_error(cudaError_t err, const char* file, int line) {
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
-
-struct CircleData {
-    float3 position;
-    float  radius;
-    float3 color;
-};
-
 
 // tile-circle pair
 struct TileCirclePair {
@@ -78,13 +72,9 @@ struct GlobalConstants {
     TileCirclePair* tileCirclePairs;
     int numTilesX;
     int numTilesY;
-    int tileWidth;
-    int tileHeight;
     int* tileOffsets;
     int* pairCounter;
     int maxPairs;
-    int* cudaDeviceCirclePairCounts;
-    int* cudaDeviceCirclePairOffsets;
 };
 
 // Global variable that is in scope, but read-only, for all cuda
@@ -366,53 +356,7 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
-// count how many pairs each circle will generate
-__global__ void kernelCountCirclePairs() {
-    int circle_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (circle_id >= cuConstRendererParams.numberOfCircles)
-        return;
-
-    int index3 = 3 * circle_id;
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float rad = cuConstRendererParams.radius[circle_id];
-
-    int imageWidth = cuConstRendererParams.imageWidth;
-    int imageHeight = cuConstRendererParams.imageHeight;
-    int numTilesX = cuConstRendererParams.numTilesX;
-    int numTilesY = cuConstRendererParams.numTilesY;
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
-
-    // bounding box boundaries
-    int minX = static_cast<int>(imageWidth * (p.x - rad));
-    int maxX = static_cast<int>(imageWidth * (p.x + rad));
-    int minY = static_cast<int>(imageHeight * (p.y - rad));
-    int maxY = static_cast<int>(imageHeight * (p.y + rad));
-
-    int bboxMinTileX = max(0, minX / tileWidth);
-    int bboxMaxTileX = min(numTilesX - 1, maxX / tileWidth);
-    int bboxMinTileY = max(0, minY / tileHeight);
-    int bboxMaxTileY = min(numTilesY - 1, maxY / tileHeight);
-
-    // center tile
-    int centerPixelX = static_cast<int>(p.x * imageWidth);
-    int centerPixelY = static_cast<int>(p.y * imageHeight);
-    
-    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / tileWidth));
-    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / tileHeight));
-
-    // always include at least one tile
-    int startTileX = min(bboxMinTileX, centerTileX);
-    int endTileX   = max(bboxMaxTileX, centerTileX);
-    int startTileY = min(bboxMinTileY, centerTileY);
-    int endTileY   = max(bboxMaxTileY, centerTileY);
-
-    // Count pairs for this circle
-    int pairCount = (endTileX - startTileX + 1) * (endTileY - startTileY + 1);
-    cuConstRendererParams.cudaDeviceCirclePairCounts[circle_id] = pairCount;
-}
-
-// generate pairs using pre-computed offsets
+// one thread per circle
 __global__ void kernelAssignCirclesToTiles() {
     int circle_id = blockIdx.x * blockDim.x + threadIdx.x;
     if (circle_id >= cuConstRendererParams.numberOfCircles)
@@ -422,12 +366,11 @@ __global__ void kernelAssignCirclesToTiles() {
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
     float rad = cuConstRendererParams.radius[circle_id];
 
+
     int imageWidth = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
     int numTilesX = cuConstRendererParams.numTilesX;
     int numTilesY = cuConstRendererParams.numTilesY;
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
 
     // bounding box boundaries
     int minX = static_cast<int>(imageWidth * (p.x - rad));
@@ -435,17 +378,18 @@ __global__ void kernelAssignCirclesToTiles() {
     int minY = static_cast<int>(imageHeight * (p.y - rad));
     int maxY = static_cast<int>(imageHeight * (p.y + rad));
 
-    int bboxMinTileX = max(0, minX / tileWidth);
-    int bboxMaxTileX = min(numTilesX - 1, maxX / tileWidth);
-    int bboxMinTileY = max(0, minY / tileHeight);
-    int bboxMaxTileY = min(numTilesY - 1, maxY / tileHeight);
+    int bboxMinTileX = max(0, minX / TILE_WIDTH);
+    int bboxMaxTileX = min(numTilesX - 1, maxX / TILE_WIDTH);
+    int bboxMinTileY = max(0, minY / TILE_HEIGHT);
+    int bboxMaxTileY = min(numTilesY - 1, maxY / TILE_HEIGHT);
+
 
     // center tile
     int centerPixelX = static_cast<int>(p.x * imageWidth);
     int centerPixelY = static_cast<int>(p.y * imageHeight);
     
-    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / tileWidth));
-    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / tileHeight));
+    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / TILE_WIDTH));
+    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / TILE_HEIGHT));
 
     // always include at least one tile
     int startTileX = min(bboxMinTileX, centerTileX);
@@ -453,20 +397,17 @@ __global__ void kernelAssignCirclesToTiles() {
     int startTileY = min(bboxMinTileY, centerTileY);
     int endTileY   = max(bboxMaxTileY, centerTileY);
 
-    int baseOffset = cuConstRendererParams.cudaDeviceCirclePairOffsets[circle_id];
-    
     // iterate over the merged safe range
-    int localIndex = 0;
     for (int tile_y = startTileY; tile_y <= endTileY; tile_y++) {
         for (int tile_x = startTileX; tile_x <= endTileX; tile_x++) {
-            int pair_index = baseOffset + localIndex;
+            int pair_index = atomicAdd(cuConstRendererParams.pairCounter, 1);
             int tile_id = tile_y * numTilesX + tile_x;
             
             if (pair_index < cuConstRendererParams.maxPairs) {
                 cuConstRendererParams.tileCirclePairs[pair_index].tile_id = tile_id;
                 cuConstRendererParams.tileCirclePairs[pair_index].circle_id = circle_id;
+            } else {
             }
-            localIndex++;
         }
     }
 }
@@ -515,30 +456,22 @@ __host__ void buildTileOffsetsGPU(TileCirclePair* d_pairs, int* d_offsets, int n
 }
 
 __global__ void kernelRenderTiles() {
-    __shared__ CircleData circle_cache[CIRCLE_CACHE_SIZE];
-
     int tileX = blockIdx.x;
     int tileY = blockIdx.y;
     int tile_id = tileY * cuConstRendererParams.numTilesX + tileX;
 
     int threadX_in_tile = threadIdx.x;
     int threadY_in_tile = threadIdx.y;
-    int thread_id_in_block = threadY_in_tile * blockDim.x + threadX_in_tile;
 
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
-    int pixelX = tileX * tileWidth + threadX_in_tile;
-    int pixelY = tileY * tileHeight + threadY_in_tile;
+    int pixelX = tileX * TILE_WIDTH + threadX_in_tile;
+    int pixelY = tileY * TILE_HEIGHT + threadY_in_tile;
     
     int imageWidth = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
 
-    // bool is_debug_thread = (pixelX >= imageWidth - 5); // unused variable removed
-
-    int offset = 4 * (pixelY * imageWidth + pixelX);
-    float4* imagePtr_global = (float4*)(&cuConstRendererParams.imageData[offset]);
-    float4 finalColor = *imagePtr_global;
-    
+    if (pixelX >= imageWidth || pixelY >= imageHeight) {
+        return;
+    }
 
     int startOffset = cuConstRendererParams.tileOffsets[tile_id];
     int endOffset = cuConstRendererParams.tileOffsets[tile_id + 1];
@@ -548,89 +481,58 @@ __global__ void kernelRenderTiles() {
         return;
     }
 
-    for (int page_start = 0; page_start < numCirclesInTile; page_start += CIRCLE_CACHE_SIZE) {
-        
-        // D1. 协同加载当前页的数据到共享内存
-        // 只有块内的前 CIRCLE_CACHE_SIZE 个线程参与加载
-        if (thread_id_in_block < CIRCLE_CACHE_SIZE) {
-            int circle_index_in_page = thread_id_in_block;
-            int circle_index_in_tile = page_start + circle_index_in_page;
+    int offset = 4 * (pixelY * imageWidth + pixelX);
+    float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[offset]);
+    float4 finalColor = *imagePtr;
 
-            // 确保不会读取超过 `numCirclesInTile` 的范围（处理最后一页）
-            if (circle_index_in_tile < numCirclesInTile) {
-                int circle_id = cuConstRendererParams.tileCirclePairs[startOffset + circle_index_in_tile].circle_id;
-            
-                // 从全局内存读取并写入共享内存
-                circle_cache[circle_index_in_page].position = *(float3*)(&cuConstRendererParams.position[circle_id * 3]);
-                circle_cache[circle_index_in_page].radius   = cuConstRendererParams.radius[circle_id];
-            
-                if (cuConstRendererParams.sceneName != SNOWFLAKES && cuConstRendererParams.sceneName != SNOWFLAKES_SINGLE_FRAME) {
-                     circle_cache[circle_index_in_page].color = *(float3*)&(cuConstRendererParams.color[circle_id * 3]);
-                }
-            }
+    float pixelCenterX = static_cast<float>(pixelX) + 0.5f;
+    float pixelCenterY = static_cast<float>(pixelY) + 0.5f;
+
+    for (int i = 0; i < numCirclesInTile; ++i) {
+        int circle_id = cuConstRendererParams.tileCirclePairs[startOffset + i].circle_id;
+        
+        float3 p_norm = *(float3*)(&cuConstRendererParams.position[circle_id * 3]);
+        float rad_norm = cuConstRendererParams.radius[circle_id];
+        
+        // pixel space
+        float circleCenterX_pixels = p_norm.x * imageWidth;
+        float circleCenterY_pixels = p_norm.y * imageHeight;
+        
+        float radius_pixels = rad_norm * imageWidth;
+
+        float diffX_pixels = circleCenterX_pixels - pixelCenterX;
+        float diffY_pixels = circleCenterY_pixels - pixelCenterY;
+        float distSq_pixels = diffX_pixels * diffX_pixels + diffY_pixels * diffY_pixels;
+        float radSq_pixels = radius_pixels * radius_pixels;
+
+        if (distSq_pixels > radSq_pixels) {
+            continue;
+        }
+        float3 rgb;
+        float alpha;
+
+        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float normPixelDist = sqrtf(distSq_pixels) / radius_pixels;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - p_norm.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        } else {
+            rgb = *(float3*)&(cuConstRendererParams.color[circle_id * 3]);
+            alpha = .5f;
         }
         
-        // 同步栅栏：确保本页数据全部加载完成，才能进入计算阶段
-        __syncthreads();
-
-        // D2. 处理已缓存到共享内存中的数据
-        // 计算当前页实际有效的圆数量
-        int num_circles_in_this_page = min(CIRCLE_CACHE_SIZE, numCirclesInTile - page_start);
-        float pixelCenterX = static_cast<float>(pixelX) + 0.5f;
-        float pixelCenterY = static_cast<float>(pixelY) + 0.5f;
-
-        // 内层循环：所有线程（0-1023）处理共享内存中的数据
-        for (int i = 0; i < num_circles_in_this_page; i++) {
-            CircleData current_circle = circle_cache[i]; // 从快速的共享内存读取
-            
-            // --- 渲染与颜色混合逻辑 (与您的原始代码相同) ---
-            float circleCenterX_pixels = current_circle.position.x * imageWidth;
-            float circleCenterY_pixels = current_circle.position.y * imageHeight;
-            float radius_pixels = current_circle.radius * imageWidth;
-
-            float diffX_pixels = circleCenterX_pixels - pixelCenterX;
-            float diffY_pixels = circleCenterY_pixels - pixelCenterY;
-            float distSq_pixels = diffX_pixels * diffX_pixels + diffY_pixels * diffY_pixels;
-            float radSq_pixels = radius_pixels * radius_pixels;
-
-            if (distSq_pixels > radSq_pixels) {
-                continue;
-            }
-            float3 rgb;
-            float alpha;
-
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-
-                float normPixelDist = sqrtf(distSq_pixels) / radius_pixels;
-                rgb = lookupColor(normPixelDist);
-
-                float maxAlpha = .6f + .4f * (1.f - current_circle.position.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-            } else {
-                rgb = current_circle.color;
-                alpha = .5f;
-            }
-            
-            float oneMinusAlpha = 1.f - alpha;
-            finalColor.x = alpha * rgb.x + oneMinusAlpha * finalColor.x;
-            finalColor.y = alpha * rgb.y + oneMinusAlpha * finalColor.y;
-            finalColor.z = alpha * rgb.z + oneMinusAlpha * finalColor.z;
-        }
-
-        // 确保所有线程都完成了本页的计算，在进入下一页加载前同步
-        // 对于当前颜色混合算法，此同步点不是严格必需的，但保留它是更安全的设计
-        __syncthreads();
+        float oneMinusAlpha = 1.f - alpha;
+        finalColor.x = alpha * rgb.x + oneMinusAlpha * finalColor.x;
+        finalColor.y = alpha * rgb.y + oneMinusAlpha * finalColor.y;
+        finalColor.z = alpha * rgb.z + oneMinusAlpha * finalColor.z;
     }
 
-    // --------------------------------------------------------------------------
-    // E. 将最终结果写回全局内存
-    // --------------------------------------------------------------------------
-    
-    
-    *imagePtr_global = finalColor;
+    *imagePtr = finalColor;
 }
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -656,10 +558,6 @@ CudaRenderer::CudaRenderer() {
     cudaDevicePairCounter = NULL;
     cudaDeviceSortTempStorage = NULL;
     sortTempStorageBytes = 0;
-    cudaDeviceCirclePairCounts = NULL;
-    cudaDeviceCirclePairOffsets = NULL;
-    cudaDeviceScanTempStorage = NULL;
-    scanTempStorageBytes = 0;
     numTilesX = 0;
     numTilesY = 0;
     maxPairs = 0;
@@ -692,9 +590,6 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceTileOffsets);
         cudaFree(cudaDevicePairCounter);
         cudaFree(cudaDeviceSortTempStorage);
-        cudaFree(cudaDeviceCirclePairCounts);
-        cudaFree(cudaDeviceCirclePairOffsets);
-        cudaFree(cudaDeviceScanTempStorage);
     }
 }
 
@@ -720,18 +615,6 @@ CudaRenderer::loadScene(SceneName scene) {
     loadCircleScene(sceneName, numberOfCircles, position, velocity, color, radius);
 }
 
-int getTileResol(int imageResolution) {
-    if (imageResolution % 25 == 0) {
-        return 25;
-    }
-    for (int i = 32; i >= 8; --i) {
-        if (imageResolution % i == 0) {
-            return i;
-        }
-    }
-    return 16; // default fallback value
-}
-
 void
 CudaRenderer::setup() {
 
@@ -749,13 +632,11 @@ CudaRenderer::setup() {
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n");
-    tileWidth = getTileResol(image->width);
-    tileHeight = getTileResol(image->height);
-    numTilesX = (image->width + tileWidth - 1) / tileWidth;
-    numTilesY = (image->height + tileHeight - 1) / tileHeight;
+
+    numTilesX = (image->width + TILE_WIDTH - 1) / TILE_WIDTH;
+    numTilesY = (image->height + TILE_HEIGHT - 1) / TILE_HEIGHT;
     int numTiles = numTilesX * numTilesY;
-    
-    maxPairs = numberOfCircles * 2500; // Increased safety margin for hypnosis scene
+    maxPairs = numberOfCircles * 3000; // Increased safety margin for hypnosis scene
 
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numberOfCircles);
@@ -768,15 +649,6 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceSortBuffer, sizeof(TileCirclePair) * maxPairs);
     cudaMalloc(&cudaDeviceTileOffsets, sizeof(int) * (numTiles + 1)); // Using the correct size
     cudaMalloc(&cudaDevicePairCounter, sizeof(int));
-    
-    // Memory for exclusive scan approach
-    cudaMalloc(&cudaDeviceCirclePairCounts, sizeof(int) * numberOfCircles);
-    cudaMalloc(&cudaDeviceCirclePairOffsets, sizeof(int) * numberOfCircles);
-    
-    // Determine temporary storage size for CUB ExclusiveSum
-    cub::DeviceScan::ExclusiveSum(NULL, scanTempStorageBytes, (int*)NULL, (int*)NULL, numberOfCircles);
-    cudaMalloc(&cudaDeviceScanTempStorage, scanTempStorageBytes);
-    
     // Note: cudaDeviceSortTempStorage is not allocated here because the CUB code
     // to determine its size is commented out. This is fine for CPU sorting.
 
@@ -797,14 +669,10 @@ CudaRenderer::setup() {
     params.imageData = cudaDeviceImageData;
     params.numTilesX = numTilesX;
     params.numTilesY = numTilesY;
-    params.tileWidth = tileWidth;
-    params.tileHeight = tileHeight;
     params.tileCirclePairs = cudaDeviceTileCirclePairs;
     params.tileOffsets = cudaDeviceTileOffsets;
     params.pairCounter = cudaDevicePairCounter;
     params.maxPairs = maxPairs;
-    params.cudaDeviceCirclePairCounts = cudaDeviceCirclePairCounts;
-    params.cudaDeviceCirclePairOffsets = cudaDeviceCirclePairOffsets;
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
     int* permX;
@@ -884,37 +752,31 @@ CudaRenderer::advanceAnimation() {
 
 void
 CudaRenderer::render() {
-    printf("Total number of circles: %d\n", numberOfCircles);
-    dim3 countGridDim((numberOfCircles + 127) / 128);
-    dim3 countBlockDim(128);
-    kernelCountCirclePairs<<<countGridDim, countBlockDim>>>();
-    // cirle, number of tiles covered
-    
-    cub::DeviceScan::ExclusiveSum(cudaDeviceScanTempStorage, scanTempStorageBytes, 
-                                  cudaDeviceCirclePairCounts, cudaDeviceCirclePairOffsets, numberOfCircles);
-    // circle, offset of pairs for this circle
+    // 256 threads per block is a healthy number
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
 
-    int lastOffset, lastCount;
-    cudaMemcpy(&lastOffset, &cudaDeviceCirclePairOffsets[numberOfCircles - 1], sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&lastCount, &cudaDeviceCirclePairCounts[numberOfCircles - 1], sizeof(int), cudaMemcpyDeviceToHost);
-    int numPairs = lastOffset + lastCount;
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
+    // cudaDeviceSynchronize();
+    cudaMemset(cudaDevicePairCounter, 0, sizeof(int));
     
-    dim3 assignGridDim((numberOfCircles + 127) / 128);
-    dim3 assignBlockDim(128);
+    dim3 assignGridDim((numberOfCircles + 255) / 256);
+    dim3 assignBlockDim(256);
     kernelAssignCirclesToTiles<<<assignGridDim, assignBlockDim>>>();
-    // circle, tile id, tile id
+    
+    int numPairs;
+    cudaMemcpy(&numPairs, cudaDevicePairCounter, sizeof(int), cudaMemcpyDeviceToHost);
     
     // GPU sorting using Thrust
     thrust::device_ptr<TileCirclePair> dev_pairs_ptr(cudaDeviceTileCirclePairs);
     thrust::sort(dev_pairs_ptr, dev_pairs_ptr + numPairs);
-    // tile id, circle id
     
     // GPU build tile offsets
     int numTiles = numTilesX * numTilesY;
     buildTileOffsetsGPU(cudaDeviceTileCirclePairs, cudaDeviceTileOffsets, numPairs, numTiles);
 
     dim3 renderGridDim(numTilesX, numTilesY);
-    dim3 renderBlockDim(tileWidth, tileHeight);
+    dim3 renderBlockDim(TILE_WIDTH, TILE_HEIGHT);
     kernelRenderTiles<<<renderGridDim, renderBlockDim>>>();
 
     cudaDeviceSynchronize();

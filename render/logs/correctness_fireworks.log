@@ -1,0 +1,22 @@
+Rendering to 1150x1150 image
+Loaded scene with 315 circles
+Loaded scene with 315 circles
+---------------------------------------------------------
+Initializing CUDA for CudaRenderer
+Found 1 CUDA devices
+Device 0: NVIDIA GeForce RTX 2080
+   SMs:        46
+   Global mem: 7959 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+
+Running benchmark, 1 frames, beginning at frame 0 ...
+Total number of circles: 315
+Copying image data from device
+***************** Correctness check passed **************************
+Clear:    0.1642 ms
+Advance:  0.0277 ms
+Render:   0.2321 ms
+Total:    0.4240 ms
+
+Overall:  0.0197 sec (note units are seconds)

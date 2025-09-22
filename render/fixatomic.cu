@@ -25,6 +25,8 @@
 #include <cub/cub.cuh>
 
 #define CIRCLE_CACHE_SIZE 256
+#define TILE_WIDTH 25
+#define TILE_HEIGHT 25
 #define CUDA_CHECK(err) (cuda_check_error(err, __FILE__, __LINE__))
 
 inline void cuda_check_error(cudaError_t err, const char* file, int line) {
@@ -78,8 +80,6 @@ struct GlobalConstants {
     TileCirclePair* tileCirclePairs;
     int numTilesX;
     int numTilesY;
-    int tileWidth;
-    int tileHeight;
     int* tileOffsets;
     int* pairCounter;
     int maxPairs;
@@ -380,8 +380,6 @@ __global__ void kernelCountCirclePairs() {
     int imageHeight = cuConstRendererParams.imageHeight;
     int numTilesX = cuConstRendererParams.numTilesX;
     int numTilesY = cuConstRendererParams.numTilesY;
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
 
     // bounding box boundaries
     int minX = static_cast<int>(imageWidth * (p.x - rad));
@@ -389,17 +387,17 @@ __global__ void kernelCountCirclePairs() {
     int minY = static_cast<int>(imageHeight * (p.y - rad));
     int maxY = static_cast<int>(imageHeight * (p.y + rad));
 
-    int bboxMinTileX = max(0, minX / tileWidth);
-    int bboxMaxTileX = min(numTilesX - 1, maxX / tileWidth);
-    int bboxMinTileY = max(0, minY / tileHeight);
-    int bboxMaxTileY = min(numTilesY - 1, maxY / tileHeight);
+    int bboxMinTileX = max(0, minX / TILE_WIDTH);
+    int bboxMaxTileX = min(numTilesX - 1, maxX / TILE_WIDTH);
+    int bboxMinTileY = max(0, minY / TILE_HEIGHT);
+    int bboxMaxTileY = min(numTilesY - 1, maxY / TILE_HEIGHT);
 
     // center tile
     int centerPixelX = static_cast<int>(p.x * imageWidth);
     int centerPixelY = static_cast<int>(p.y * imageHeight);
     
-    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / tileWidth));
-    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / tileHeight));
+    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / TILE_WIDTH));
+    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / TILE_HEIGHT));
 
     // always include at least one tile
     int startTileX = min(bboxMinTileX, centerTileX);
@@ -426,8 +424,6 @@ __global__ void kernelAssignCirclesToTiles() {
     int imageHeight = cuConstRendererParams.imageHeight;
     int numTilesX = cuConstRendererParams.numTilesX;
     int numTilesY = cuConstRendererParams.numTilesY;
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
 
     // bounding box boundaries
     int minX = static_cast<int>(imageWidth * (p.x - rad));
@@ -435,17 +431,17 @@ __global__ void kernelAssignCirclesToTiles() {
     int minY = static_cast<int>(imageHeight * (p.y - rad));
     int maxY = static_cast<int>(imageHeight * (p.y + rad));
 
-    int bboxMinTileX = max(0, minX / tileWidth);
-    int bboxMaxTileX = min(numTilesX - 1, maxX / tileWidth);
-    int bboxMinTileY = max(0, minY / tileHeight);
-    int bboxMaxTileY = min(numTilesY - 1, maxY / tileHeight);
+    int bboxMinTileX = max(0, minX / TILE_WIDTH);
+    int bboxMaxTileX = min(numTilesX - 1, maxX / TILE_WIDTH);
+    int bboxMinTileY = max(0, minY / TILE_HEIGHT);
+    int bboxMaxTileY = min(numTilesY - 1, maxY / TILE_HEIGHT);
 
     // center tile
     int centerPixelX = static_cast<int>(p.x * imageWidth);
     int centerPixelY = static_cast<int>(p.y * imageHeight);
     
-    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / tileWidth));
-    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / tileHeight));
+    int centerTileX = max(0, min(numTilesX - 1, centerPixelX / TILE_WIDTH));
+    int centerTileY = max(0, min(numTilesY - 1, centerPixelY / TILE_HEIGHT));
 
     // always include at least one tile
     int startTileX = min(bboxMinTileX, centerTileX);
@@ -525,20 +521,19 @@ __global__ void kernelRenderTiles() {
     int threadY_in_tile = threadIdx.y;
     int thread_id_in_block = threadY_in_tile * blockDim.x + threadX_in_tile;
 
-    int tileWidth = cuConstRendererParams.tileWidth;
-    int tileHeight = cuConstRendererParams.tileHeight;
-    int pixelX = tileX * tileWidth + threadX_in_tile;
-    int pixelY = tileY * tileHeight + threadY_in_tile;
+    int pixelX = tileX * TILE_WIDTH + threadX_in_tile;
+    int pixelY = tileY * TILE_HEIGHT + threadY_in_tile;
     
     int imageWidth = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
 
-    // bool is_debug_thread = (pixelX >= imageWidth - 5); // unused variable removed
+    if (pixelX >= imageWidth || pixelY >= imageHeight) {
+        return;
+    }
 
     int offset = 4 * (pixelY * imageWidth + pixelX);
     float4* imagePtr_global = (float4*)(&cuConstRendererParams.imageData[offset]);
     float4 finalColor = *imagePtr_global;
-    
 
     int startOffset = cuConstRendererParams.tileOffsets[tile_id];
     int endOffset = cuConstRendererParams.tileOffsets[tile_id + 1];
@@ -628,8 +623,6 @@ __global__ void kernelRenderTiles() {
     // --------------------------------------------------------------------------
     // E. 将最终结果写回全局内存
     // --------------------------------------------------------------------------
-    
-    
     *imagePtr_global = finalColor;
 }
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -720,18 +713,6 @@ CudaRenderer::loadScene(SceneName scene) {
     loadCircleScene(sceneName, numberOfCircles, position, velocity, color, radius);
 }
 
-int getTileResol(int imageResolution) {
-    if (imageResolution % 25 == 0) {
-        return 25;
-    }
-    for (int i = 32; i >= 8; --i) {
-        if (imageResolution % i == 0) {
-            return i;
-        }
-    }
-    return 16; // default fallback value
-}
-
 void
 CudaRenderer::setup() {
 
@@ -749,12 +730,10 @@ CudaRenderer::setup() {
         printf("   CUDA Cap:   %d.%d\n", deviceProps.major, deviceProps.minor);
     }
     printf("---------------------------------------------------------\n");
-    tileWidth = getTileResol(image->width);
-    tileHeight = getTileResol(image->height);
-    numTilesX = (image->width + tileWidth - 1) / tileWidth;
-    numTilesY = (image->height + tileHeight - 1) / tileHeight;
+
+    numTilesX = (image->width + TILE_WIDTH - 1) / TILE_WIDTH;
+    numTilesY = (image->height + TILE_HEIGHT - 1) / TILE_HEIGHT;
     int numTiles = numTilesX * numTilesY;
-    
     maxPairs = numberOfCircles * 2500; // Increased safety margin for hypnosis scene
 
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numberOfCircles);
@@ -797,8 +776,6 @@ CudaRenderer::setup() {
     params.imageData = cudaDeviceImageData;
     params.numTilesX = numTilesX;
     params.numTilesY = numTilesY;
-    params.tileWidth = tileWidth;
-    params.tileHeight = tileHeight;
     params.tileCirclePairs = cudaDeviceTileCirclePairs;
     params.tileOffsets = cudaDeviceTileOffsets;
     params.pairCounter = cudaDevicePairCounter;
@@ -885,8 +862,8 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
     printf("Total number of circles: %d\n", numberOfCircles);
-    dim3 countGridDim((numberOfCircles + 127) / 128);
-    dim3 countBlockDim(128);
+    dim3 countGridDim((numberOfCircles + 255) / 256);
+    dim3 countBlockDim(256);
     kernelCountCirclePairs<<<countGridDim, countBlockDim>>>();
     // cirle, number of tiles covered
     
@@ -899,8 +876,8 @@ CudaRenderer::render() {
     cudaMemcpy(&lastCount, &cudaDeviceCirclePairCounts[numberOfCircles - 1], sizeof(int), cudaMemcpyDeviceToHost);
     int numPairs = lastOffset + lastCount;
     
-    dim3 assignGridDim((numberOfCircles + 127) / 128);
-    dim3 assignBlockDim(128);
+    dim3 assignGridDim((numberOfCircles + 255) / 256);
+    dim3 assignBlockDim(256);
     kernelAssignCirclesToTiles<<<assignGridDim, assignBlockDim>>>();
     // circle, tile id, tile id
     
@@ -914,7 +891,7 @@ CudaRenderer::render() {
     buildTileOffsetsGPU(cudaDeviceTileCirclePairs, cudaDeviceTileOffsets, numPairs, numTiles);
 
     dim3 renderGridDim(numTilesX, numTilesY);
-    dim3 renderBlockDim(tileWidth, tileHeight);
+    dim3 renderBlockDim(TILE_WIDTH, TILE_HEIGHT);
     kernelRenderTiles<<<renderGridDim, renderBlockDim>>>();
 
     cudaDeviceSynchronize();
