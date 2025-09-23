@@ -550,17 +550,13 @@ __global__ void kernelRenderTiles() {
 
     for (int page_start = 0; page_start < numCirclesInTile; page_start += CIRCLE_CACHE_SIZE) {
         
-        // D1. 协同加载当前页的数据到共享内存
-        // 只有块内的前 CIRCLE_CACHE_SIZE 个线程参与加载
         if (thread_id_in_block < CIRCLE_CACHE_SIZE) {
             int circle_index_in_page = thread_id_in_block;
             int circle_index_in_tile = page_start + circle_index_in_page;
 
-            // 确保不会读取超过 `numCirclesInTile` 的范围（处理最后一页）
             if (circle_index_in_tile < numCirclesInTile) {
                 int circle_id = cuConstRendererParams.tileCirclePairs[startOffset + circle_index_in_tile].circle_id;
             
-                // 从全局内存读取并写入共享内存
                 circle_cache[circle_index_in_page].position = *(float3*)(&cuConstRendererParams.position[circle_id * 3]);
                 circle_cache[circle_index_in_page].radius   = cuConstRendererParams.radius[circle_id];
             
@@ -570,20 +566,15 @@ __global__ void kernelRenderTiles() {
             }
         }
         
-        // 同步栅栏：确保本页数据全部加载完成，才能进入计算阶段
         __syncthreads();
 
-        // D2. 处理已缓存到共享内存中的数据
-        // 计算当前页实际有效的圆数量
         int num_circles_in_this_page = min(CIRCLE_CACHE_SIZE, numCirclesInTile - page_start);
         float pixelCenterX = static_cast<float>(pixelX) + 0.5f;
         float pixelCenterY = static_cast<float>(pixelY) + 0.5f;
 
-        // 内层循环：所有线程（0-1023）处理共享内存中的数据
         for (int i = 0; i < num_circles_in_this_page; i++) {
-            CircleData current_circle = circle_cache[i]; // 从快速的共享内存读取
+            CircleData current_circle = circle_cache[i];
             
-            // --- 渲染与颜色混合逻辑 (与您的原始代码相同) ---
             float circleCenterX_pixels = current_circle.position.x * imageWidth;
             float circleCenterY_pixels = current_circle.position.y * imageHeight;
             float radius_pixels = current_circle.radius * imageWidth;
@@ -620,14 +611,9 @@ __global__ void kernelRenderTiles() {
             finalColor.z = alpha * rgb.z + oneMinusAlpha * finalColor.z;
         }
 
-        // 确保所有线程都完成了本页的计算，在进入下一页加载前同步
-        // 对于当前颜色混合算法，此同步点不是严格必需的，但保留它是更安全的设计
         __syncthreads();
     }
 
-    // --------------------------------------------------------------------------
-    // E. 将最终结果写回全局内存
-    // --------------------------------------------------------------------------
     
     
     *imagePtr_global = finalColor;
